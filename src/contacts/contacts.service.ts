@@ -1,6 +1,17 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+  OnApplicationBootstrap,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { BitrixService } from '../bitrix/bitrix.service';
+import {
+  BATCH_LIMIT,
+  BatchCommand,
+  BitrixBatchError,
+  BitrixService,
+} from '../bitrix/bitrix.service';
 import { BankDto, CreateContactDto } from './dto/create-contact.dto';
 import { UpdateContactDto } from './dto/update-contact.dto';
 
@@ -24,7 +35,10 @@ interface BankInfo extends BankDto {
 }
 
 @Injectable()
-export class ContactsService {
+export class ContactsService implements OnApplicationBootstrap {
+  private readonly logger = new Logger(ContactsService.name);
+  private presetVerified = false;
+
   constructor(
     private readonly bitrix: BitrixService,
     private readonly config: ConfigService,
@@ -52,30 +66,65 @@ export class ContactsService {
     return this.toContact(raw, banks.get(id));
   }
 
-  /** Tạo contact mới, sau đó tạo requisite + thông tin ngân hàng nếu có */
+  /**
+   * Tạo contact mới. Nếu có bank thì tạo contact + requisite + bank detail trong
+   * 1 batch; nếu batch lỗi giữa chừng thì xoá contact vừa tạo (rollback thủ công).
+   */
   async create(dto: CreateContactDto) {
-    const { result: id } = await this.bitrix.callBitrixAPI('crm.contact.add', {
-      fields: this.toFields(dto),
-    });
-    if (dto.bank) await this.saveBank(String(id), dto.name, dto.bank);
-    return this.findOne(String(id));
+    if (!dto.bank) {
+      const { result: id } = await this.bitrix.callBitrixAPI(
+        'crm.contact.add',
+        { fields: this.toFields(dto) },
+      );
+      return this.findOne(String(id));
+    }
+
+    await this.assertPresetValid();
+    const commands: Record<string, BatchCommand> = {
+      contact: {
+        method: 'crm.contact.add',
+        params: { fields: this.toFields(dto) },
+      },
+      ...this.newBankCommands('$result[contact]', dto.name, dto.bank),
+    };
+
+    let results: Record<string, any>;
+    try {
+      results = await this.bitrix.callBatch(commands);
+    } catch (err) {
+      const created = err instanceof BitrixBatchError && err.partial.contact;
+      if (created) await this.rollbackContact(String(created));
+      throw err;
+    }
+    return this.findOne(String(results.contact));
   }
 
-  /** Cập nhật contact; chỉ ghi các field được gửi lên */
+  /** Cập nhật contact; chỉ ghi các field được gửi lên (gộp thành 1 batch) */
   async update(id: string, dto: UpdateContactDto) {
     const current = await this.findRaw(id);
+    const commands: Record<string, BatchCommand> = {};
+
     const fields = this.toFields(dto, current);
     if (Object.keys(fields).length) {
-      await this.bitrix.callBitrixAPI('crm.contact.update', { id, fields });
+      commands.contact = {
+        method: 'crm.contact.update',
+        params: { id, fields },
+      };
     }
     if (dto.bank) {
+      await this.assertPresetValid();
       const existing = (await this.getBankInfo([id])).get(id);
-      await this.saveBank(id, dto.name ?? current.NAME, dto.bank, existing);
+      Object.assign(
+        commands,
+        this.bankCommands(id, dto.name ?? current.NAME, dto.bank, existing),
+      );
     }
+
+    await this.bitrix.callBatch(commands);
     return this.findOne(id);
   }
 
-  /** Xoá requisites (thông tin ngân hàng) rồi xoá contact */
+  /** Xoá requisites (thông tin ngân hàng) rồi xoá contact, gộp thành batch */
   async remove(id: string) {
     await this.findRaw(id);
     const { result: requisites } = await this.bitrix.callBitrixAPI(
@@ -85,11 +134,71 @@ export class ContactsService {
         select: ['ID'],
       },
     );
-    for (const r of requisites) {
-      await this.bitrix.callBitrixAPI('crm.requisite.delete', { id: r.ID });
+
+    const commands: [string, BatchCommand][] = [
+      ...requisites.map((r, i): [string, BatchCommand] => [
+        `requisite${i}`,
+        { method: 'crm.requisite.delete', params: { id: r.ID } },
+      ]),
+      ['contact', { method: 'crm.contact.delete', params: { id } }],
+    ];
+    // Contact nằm ở lệnh cuối nên chỉ bị xoá khi mọi requisite đã xoá xong
+    for (let i = 0; i < commands.length; i += BATCH_LIMIT) {
+      await this.bitrix.callBatch(
+        Object.fromEntries(commands.slice(i, i + BATCH_LIMIT)),
+      );
     }
-    await this.bitrix.callBitrixAPI('crm.contact.delete', { id });
     return { message: `Đã xoá contact ${id}` };
+  }
+
+  /** Kiểm tra preset khi khởi động (chỉ cảnh báo, không chặn app khởi động) */
+  async onApplicationBootstrap() {
+    try {
+      await this.assertPresetValid();
+      this.logger.log(`Preset requisite ${this.presetId} hợp lệ`);
+    } catch (err: any) {
+      this.logger.warn(`Chưa kiểm tra được preset requisite: ${err.message}`);
+    }
+  }
+
+  private get presetId() {
+    return Number(this.config.get('BITRIX24_REQUISITE_PRESET_ID', 1));
+  }
+
+  /**
+   * Đảm bảo BITRIX24_REQUISITE_PRESET_ID tồn tại và đang bật trên Bitrix24.
+   * Gọi trước khi ghi dữ liệu để không tạo ra contact dở dang. Kết quả hợp lệ
+   * được cache; nếu lỗi thì lần sau kiểm tra lại.
+   */
+  private async assertPresetValid() {
+    if (this.presetVerified) return;
+    const id = this.presetId;
+    const { result } = await this.bitrix.callBitrixAPI(
+      'crm.requisite.preset.list',
+      { filter: { ID: id }, select: ['ID', 'NAME', 'ACTIVE'] },
+    );
+    const preset = Number.isInteger(id) ? result?.[0] : undefined;
+    if (!preset) {
+      throw new InternalServerErrorException(
+        `BITRIX24_REQUISITE_PRESET_ID=${this.config.get('BITRIX24_REQUISITE_PRESET_ID', 1)} không tồn tại trên Bitrix24 (xem crm.requisite.preset.list)`,
+      );
+    }
+    if (preset.ACTIVE === 'N') {
+      throw new InternalServerErrorException(
+        `Preset requisite ${id} ("${preset.NAME}") đang bị tắt trên Bitrix24`,
+      );
+    }
+    this.presetVerified = true;
+  }
+
+  /** Xoá contact vừa tạo khi các bước sau (requisite / bank) thất bại */
+  private async rollbackContact(id: string) {
+    try {
+      await this.bitrix.callBitrixAPI('crm.contact.delete', { id });
+      this.logger.warn(`Đã rollback: xoá contact ${id} do tạo bank thất bại`);
+    } catch (err: any) {
+      this.logger.error(`Rollback contact ${id} thất bại: ${err.message}`);
+    }
   }
 
   /** Lấy dữ liệu gốc của contact, ném 404 nếu không tồn tại */
@@ -104,55 +213,75 @@ export class ContactsService {
     return result[0];
   }
 
+  /** Các lệnh batch tạo mới requisite + bank detail cho contact */
+  private newBankCommands(
+    contactId: string,
+    contactName: string,
+    bank: BankDto,
+  ): Record<string, BatchCommand> {
+    return {
+      requisite: {
+        method: 'crm.requisite.add',
+        params: {
+          fields: {
+            ENTITY_TYPE_ID: CONTACT_ENTITY_TYPE_ID,
+            ENTITY_ID: contactId,
+            PRESET_ID: this.presetId,
+            NAME: contactName,
+          },
+        },
+      },
+      bank: {
+        method: 'crm.requisite.bankdetail.add',
+        params: {
+          fields: { ENTITY_ID: '$result[requisite]', ...this.bankFields(bank) },
+        },
+      },
+    };
+  }
+
   /**
-   * Tạo mới hoặc cập nhật thông tin ngân hàng:
+   * Các lệnh batch tạo mới hoặc cập nhật thông tin ngân hàng:
    * requisite (crm.requisite.*) gắn với contact, bank detail
    * (crm.requisite.bankdetail.*) gắn với requisite.
    */
-  private async saveBank(
+  private bankCommands(
     contactId: string,
     contactName: string,
     bank: BankDto,
     existing?: BankInfo,
-  ) {
-    const bankFields = {
+  ): Record<string, BatchCommand> {
+    if (!existing) return this.newBankCommands(contactId, contactName, bank);
+
+    const commands: Record<string, BatchCommand> = {
+      requisite: {
+        method: 'crm.requisite.update',
+        params: { id: existing.requisiteId, fields: { NAME: contactName } },
+      },
+    };
+    commands.bank = existing.bankDetailId
+      ? {
+          method: 'crm.requisite.bankdetail.update',
+          params: { id: existing.bankDetailId, fields: this.bankFields(bank) },
+        }
+      : {
+          method: 'crm.requisite.bankdetail.add',
+          params: {
+            fields: {
+              ENTITY_ID: existing.requisiteId,
+              ...this.bankFields(bank),
+            },
+          },
+        };
+    return commands;
+  }
+
+  private bankFields(bank: BankDto) {
+    return {
       NAME: bank.bankName,
       RQ_BANK_NAME: bank.bankName,
       RQ_ACC_NUM: bank.accountNumber,
     };
-
-    if (!existing) {
-      const { result: requisiteId } = await this.bitrix.callBitrixAPI(
-        'crm.requisite.add',
-        {
-          fields: {
-            ENTITY_TYPE_ID: CONTACT_ENTITY_TYPE_ID,
-            ENTITY_ID: contactId,
-            PRESET_ID: this.config.get('BITRIX24_REQUISITE_PRESET_ID', 1),
-            NAME: contactName,
-          },
-        },
-      );
-      await this.bitrix.callBitrixAPI('crm.requisite.bankdetail.add', {
-        fields: { ENTITY_ID: requisiteId, ...bankFields },
-      });
-      return;
-    }
-
-    await this.bitrix.callBitrixAPI('crm.requisite.update', {
-      id: existing.requisiteId,
-      fields: { NAME: contactName },
-    });
-    if (existing.bankDetailId) {
-      await this.bitrix.callBitrixAPI('crm.requisite.bankdetail.update', {
-        id: existing.bankDetailId,
-        fields: bankFields,
-      });
-    } else {
-      await this.bitrix.callBitrixAPI('crm.requisite.bankdetail.add', {
-        fields: { ENTITY_ID: existing.requisiteId, ...bankFields },
-      });
-    }
   }
 
   /** Lấy thông tin ngân hàng của nhiều contact, trả về Map<contactId, BankInfo> */

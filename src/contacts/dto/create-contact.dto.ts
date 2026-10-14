@@ -39,8 +39,8 @@ export class BankDto {
   bankName: string;
 
   @ApiProperty({ example: '0123456789' })
-  @Matches(/^[0-9]{6,20}$/, {
-    message: 'Số tài khoản không hợp lệ (6-20 chữ số)',
+  @Matches(/^[A-Za-z0-9]{6,34}$/, {
+    message: 'Số tài khoản không hợp lệ (6-34 ký tự, chỉ gồm chữ và số)',
   })
   accountNumber: string;
 }

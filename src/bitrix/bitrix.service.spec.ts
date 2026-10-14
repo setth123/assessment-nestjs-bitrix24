@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import { of, throwError } from 'rxjs';
 import { AuthService } from '../auth/auth.service';
-import { BitrixService } from './bitrix.service';
+import { BitrixBatchError, BitrixService } from './bitrix.service';
 
 const token = {
   access_token: 'access-1',
@@ -100,5 +100,70 @@ describe('BitrixService', () => {
     await expect(service.callBitrixAPI('crm.contact.list')).rejects.toThrow(
       BadGatewayException,
     );
+  });
+
+  describe('callBatch', () => {
+    it('mã hoá cmd kiểu query string và giữ nguyên tham chiếu $result', async () => {
+      http.post.mockReturnValue(
+        of({ data: { result: { result: { contact: 7, requisite: 9 } } } }),
+      );
+
+      const res = await service.callBatch({
+        contact: {
+          method: 'crm.contact.add',
+          params: { fields: { NAME: 'A B', PHONE: [{ VALUE: '090' }] } },
+        },
+        requisite: {
+          method: 'crm.requisite.add',
+          params: { fields: { ENTITY_ID: '$result[contact]' } },
+        },
+      });
+
+      expect(http.post).toHaveBeenCalledWith(
+        'https://test.bitrix24.com/rest/batch.json',
+        {
+          halt: 1,
+          cmd: {
+            contact:
+              'crm.contact.add?fields[NAME]=A%20B&fields[PHONE][0][VALUE]=090',
+            requisite: 'crm.requisite.add?fields[ENTITY_ID]=$result[contact]',
+          },
+          auth: 'access-1',
+        },
+        expect.any(Object),
+      );
+      expect(res).toEqual({ contact: 7, requisite: 9 });
+    });
+
+    it('ném BitrixBatchError kèm kết quả đã chạy khi một lệnh lỗi', async () => {
+      http.post.mockReturnValue(
+        of({
+          data: {
+            result: {
+              result: { contact: 7 },
+              result_error: {
+                requisite: { error: 'X', error_description: 'preset sai' },
+              },
+            },
+          },
+        }),
+      );
+
+      const err = await service
+        .callBatch({ contact: { method: 'a' }, requisite: { method: 'b' } })
+        .catch((e) => e);
+
+      expect(err).toBeInstanceOf(BitrixBatchError);
+      expect(err.message).toBe('Bitrix24: preset sai');
+      expect(err.partial).toEqual({ contact: 7 });
+    });
+
+    it('từ chối batch quá 50 lệnh', async () => {
+      const commands = Object.fromEntries(
+        Array.from({ length: 51 }, (_, i) => [`c${i}`, { method: 'm' }]),
+      );
+      await expect(service.callBatch(commands)).rejects.toThrow('tối đa 50');
+      expect(http.post).not.toHaveBeenCalled();
+    });
   });
 });

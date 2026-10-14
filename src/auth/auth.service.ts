@@ -87,7 +87,8 @@ export class AuthService {
           grant_type: 'refresh_token',
           refresh_token: current.refresh_token,
         });
-        return this.saveToken({ ...current, ...data });
+        // oauth.bitrix.info trả về domain của chính nó, giữ lại domain của portal
+        return this.saveToken({ ...current, ...data, domain: current.domain });
       })().finally(() => (this.refreshing = null));
     }
     return this.refreshing;
